@@ -2,7 +2,7 @@
 
 Research code for AirSim-based cooperative UAV defense experiments using recurrent multi-agent proximal policy optimization (rMAPPO), role-based rewards, dynamic role switching, and curriculum learning.
 
-This repository accompanies the manuscript **“Multi-Agent Cooperative Defense via Role-Based Rewards and Dynamic Role Switching.”** The project investigates how multiple defense UAVs can protect an asset against an approaching threat UAV by coordinating **interceptor** and **escort** roles under limited LiDAR sensing.
+This repository accompanies the manuscript **“Multi-Agent Cooperative Defense via Role-Based Rewards and Dynamic Role Switching.”** The project investigates how multiple UAVs can protect an asset against an approaching threat UAV by coordinating **interceptor** and **escort** roles under limited LiDAR sensing.
 
 > **Release status:** Source code and a summary of simulation results are included. Raw evaluation datasets, trained checkpoints, and standalone result files are not included. An independent clean-install reproduction has not been verified.
 
@@ -72,10 +72,10 @@ The following results summarize cooperative defense performance across role-assi
 
 ### Evaluation setup and metrics
 
-The main comparison uses one protected asset, three defense UAVs, and one incoming threat UAV in AirSim. The threat moves toward the asset at 10 m/s; initial UAV positions are randomized. For the main strategy comparison at a 30 m LiDAR sensing range, each strategy was independently trained **10 times**, with each trained policy evaluated over **100 episodes**. Tabulated results are reported as **mean ± standard deviation** across independent runs.
+The main comparison uses one protected asset, three UAVs, and one incoming threat UAV in AirSim. The threat moves toward the asset at 10 m/s; initial UAV positions are randomized. For the main strategy comparison at a 30 m LiDAR sensing range, each strategy was independently trained **10 times**, with each trained policy evaluated over **100 episodes**. Tabulated results are reported as **mean ± standard deviation** across independent runs.
 
 - **Defense success rate (`R_success`):** Percentage of evaluation episodes in which the threat is intercepted before reaching the protected asset.
-- **Friendly collision rate (`R_collision`):** Percentage of episodes with a collision between allied defense UAVs.
+- **Friendly collision rate (`R_collision`):** Percentage of episodes with a collision between allied UAVs.
 - **Protected-asset hit rate (`R_hit`):** Percentage of episodes in which the threat reaches or collides with the protected asset.
 
 These metrics are calculated independently and are not necessarily mutually exclusive.
@@ -110,9 +110,9 @@ Under a **30 m** LiDAR range, dynamic-role assignment was evaluated with and wit
 
 With curriculum learning, the policy reached stable performance earlier and attained a final defense success rate of **approximately 86%**, compared with **approximately 80%** without curriculum learning. These are approximate values from the training curves rather than mean ± standard deviation statistics.
 
-### 4. Effect of the number of defense UAVs (LiDAR: 30 m)
+### 4. Effect of the number of UAVs (LiDAR: 30 m)
 
-| Defense UAVs | Defense success rate | Friendly collision rate | Protected-asset hit rate |
+| UAVs | Defense success rate | Friendly collision rate | Protected-asset hit rate |
 | --- | ---: | ---: | ---: |
 | 3 | 84.3 ± 1.2% | 0.0 ± 0.0% | 15.7 ± 1.2% |
 | 4 | 89.2 ± 1.4% | 0.0 ± 0.0% | 10.8 ± 1.4% |
