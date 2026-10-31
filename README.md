@@ -1,27 +1,36 @@
 # Cooperative Multi-UAV Defense Using Multi-Agent Reinforcement Learning
 
-Research code for AirSim-based cooperative UAV defense experiments using multi-agent proximal policy optimization (MAPPO/rMAPPO), with role-based and comparison environments.
+Research code for AirSim-based cooperative UAV defense experiments using recurrent multi-agent proximal policy optimization (rMAPPO), role-based rewards, dynamic role switching, and curriculum learning.
 
-> **Research release status:** Source code is included. The experimental datasets, evaluation results, trained checkpoints, and paper citation will be added separately when they are ready for public release. No experimental results are claimed in this README.
+This repository accompanies the manuscript **“Multi-Agent Cooperative Defense via Role-Based Rewards and Dynamic Role Switching.”** The project investigates how multiple defense UAVs can protect an asset against an approaching threat UAV by coordinating **interceptor** and **escort** roles under limited LiDAR sensing.
+
+> **Release status:** The source code and a summary of the experimental results reported in the manuscript are included in this README. Raw experimental datasets, trained checkpoints, and standalone result/figure files are not included in the current repository. The numerical results below are transcribed from the manuscript; they have not been independently reproduced from a fresh installation of this repository.
+
+## Proposed approach
+
+- **Role-based rewards:** An interceptor is rewarded for approaching and intercepting the threat; escorts are rewarded for maintaining protective positions near the asset.
+- **Dynamic role switching:** A centralized assignment rule selects an interceptor among UAVs detecting the threat and can reassign this role as detection and relative positions change. UAV actions are generated individually using a shared learned policy.
+- **Curriculum learning:** The interception success radius is progressively reduced from 15 m to 1.5 m as the policy meets performance criteria.
+- **LiDAR-based partial observability:** Threat detection and role assignment depend on limited sensing ranges.
 
 ## Repository structure
 
 | Path | Contents |
 | --- | --- |
 | `train_UAV_obstacle.py` | UAV training entry point, AirSim environment wrapper, training configuration, and runner integration. |
-| `eval_UAV.py` | Evaluation entry point for a trained policy in AirSim. Requires a valid checkpoint path and appropriate AirSim configuration. |
+| `eval_UAV.py` | Evaluation entry point for a trained policy in AirSim; requires a valid local checkpoint and appropriate simulation setup. |
 | `3D_animation.py` | Utilities for visualizing recorded UAV trajectories and engagements. |
 | `intercept_geometry.json` | Configuration/data file related to interception geometry. |
 | `onpolicy/config_UAV.py` | UAV experiment arguments and default training settings. |
 | `onpolicy/config.py` | General on-policy algorithm configuration. |
-| `onpolicy/envs/` | UAV training and evaluation environments, plus vectorized environment wrappers. See variant table below. |
+| `onpolicy/envs/` | UAV training/evaluation environments and environment wrappers. |
 | `onpolicy/algorithms/r_mappo/` | Recurrent MAPPO policy networks, actor–critic components, and PPO training logic. |
-| `onpolicy/algorithms/mat/` | Multi-agent transformer algorithm components retained from the base framework. |
-| `onpolicy/algorithms/utils/` | Shared neural-network and algorithm utilities. |
-| `onpolicy/runner/shared/` | Shared-policy runners, including UAV rollout/training/evaluation runners. |
+| `onpolicy/algorithms/mat/` | Multi-agent transformer components retained from the base framework. |
+| `onpolicy/algorithms/utils/` | Neural-network and algorithm utilities. |
+| `onpolicy/runner/shared/` | Shared-policy runners, including UAV training and evaluation runners. |
 | `onpolicy/runner/separated/` | Separated-policy runners retained from the base framework. |
-| `onpolicy/utils/` | Replay buffers and shared training utilities. |
-| `onpolicy/scripts/` | Original framework scripts for other benchmark environments; not the primary UAV experiment entry point. |
+| `onpolicy/utils/` | Rollout buffers and shared training utilities. |
+| `onpolicy/scripts/` | Original framework scripts for other benchmark environments; not the primary UAV entry point. |
 | `environment.yaml`, `requirements.txt`, `setup.py` | Dependency and installation specifications. |
 | `LICENSE` | Existing MIT license and original copyright notice. |
 
@@ -29,50 +38,112 @@ Research code for AirSim-based cooperative UAV defense experiments using multi-a
 
 | File | Intended use / distinction |
 | --- | --- |
-| `onpolicy/envs/make_env_role_curriculum.py` | Dynamic role-based cooperative defense environment; currently selected by the training entry point. |
+| `onpolicy/envs/make_env_role_curriculum.py` | Dynamic role-based cooperative defense environment, selected by the supplied training entry point. |
 | `onpolicy/envs/make_env_static_role_division_2.py` | Static/fixed role allocation comparison environment. |
 | `onpolicy/envs/make_env_PN_Lidar.py` | LiDAR-based PN-style baseline environment. |
-| `onpolicy/envs/make_env_PN_LIDAR_curriculurm.py` | PN-style baseline variant with a curriculum-based interception radius. |
-| `onpolicy/envs/make_env_curriculurm_X.py` | Additional environment variant used for comparisons/ablation; inspect configuration before treating it as a specific published experiment. |
+| `onpolicy/envs/make_env_PN_LIDAR_curriculurm.py` | PN-style baseline variant with curriculum-based interception radius. |
+| `onpolicy/envs/make_env_curriculurm_X.py` | Additional environment variant for comparisons/ablation; verify its configuration before associating it with a specific manuscript result. |
 | `onpolicy/envs/eval_env.py`, `eval_env_2.py`, `eval_env_3.py` | Alternative UAV evaluation environment implementations. |
 
-**Important:** Reward functions, termination conditions, role-assignment mechanisms, and interception radii may differ between variants. Baseline environments should not be assumed to use the proposed method's reward settings.
+**Important:** Reward functions, termination conditions, role assignment, and interception radii differ across variants. Do not assume that all baseline environments use the proposed approach's reward settings. The paper's *single-role strategy* and the repository's *PN-style baseline* should not automatically be treated as identical experiments without verifying the corresponding configuration.
 
 ## Running the code
 
 1. Configure and start a compatible **AirSim** simulation with the UAV names and LiDAR sensors expected by the selected environment.
-2. Install dependencies from `environment.yaml` or `requirements.txt` as appropriate for the local Python/CUDA/AirSim setup.
-3. Review `onpolicy/config_UAV.py` and `train_UAV_obstacle.py` to set the agent count, environment variant, rollout settings, and logging options.
-4. Start training from the repository root with `python train_UAV_obstacle.py`.
-5. For evaluation, set a valid **local** model checkpoint path in `eval_UAV.py`, choose the corresponding evaluation environment, and run `python eval_UAV.py`.
+2. Install dependencies using `environment.yaml` or `requirements.txt`, as appropriate for the local Python/CUDA/AirSim installation.
+3. Review `onpolicy/config_UAV.py` and `train_UAV_obstacle.py` to select the agent count, environment variant, rollout settings, and logging options.
+4. Start training from the repository root:
 
-These commands describe the entry points in the supplied code; a clean-install, end-to-end reproduction has **not** been independently verified. In particular, `train_UAV_obstacle.py` currently hard-codes `self.num_agents = 4` in its wrapper, while some configuration/environment defaults use three followers. **Make agent counts consistent before running**. `eval_UAV.py` also contains machine-specific Windows checkpoint paths; replace them with paths relevant to your setup. Training requires AirSim and the correct vehicle/sensor definitions.
+   ```bash
+   python train_UAV_obstacle.py
+   ```
 
-## Planned experimental materials (not yet included)
+5. For evaluation, configure a valid **local** model checkpoint path in `eval_UAV.py`, select the matching environment, and run:
 
-The following directories are reserved for later releases; they are **not** included in this initial package:
+   ```bash
+   python eval_UAV.py
+   ```
+
+**Reproducibility notes:** These are entry points in the supplied code, not a verified clean-install reproduction procedure. The training wrapper currently hard-codes `self.num_agents = 4`, while some configurations/environments default to three followers; make the counts consistent. `eval_UAV.py` contains machine-specific Windows checkpoint paths that must be replaced. Results from the manuscript also depend on the corresponding scenario, sensor range, training seeds, and evaluation configuration.
+
+## Experimental results (reported in the manuscript)
+
+The results in this section come from **“Multi-Agent Cooperative Defense via Role-Based Rewards and Dynamic Role Switching,”** Tables 2–4 and Figure 3. They are **reported study results**, not outputs generated by running this GitHub repository after release.
+
+### Evaluation setup and metrics
+
+The main comparison uses one protected asset, three defense UAVs, and one incoming threat UAV in AirSim. The threat moves toward the asset at 10 m/s; initial UAV positions are randomized. For the main strategy comparison at a 30 m LiDAR sensing range, each strategy was independently trained **10 times**, with each trained policy evaluated over **100 episodes**. Tabulated results are reported as **mean ± standard deviation** across independent runs.
+
+- **Defense success rate (`R_success`):** Percentage of evaluation episodes in which the threat is intercepted before reaching the protected asset.
+- **Friendly collision rate (`R_collision`):** Percentage of episodes with a collision between allied defense UAVs.
+- **Protected-asset hit rate (`R_hit`):** Percentage of episodes in which the threat reaches or collides with the protected asset.
+
+These metrics are calculated independently and are not necessarily mutually exclusive.
+
+### 1. Comparison of role-assignment strategies (LiDAR: 30 m)
+
+| Strategy | Defense success rate | Friendly collision rate | Protected-asset hit rate |
+| --- | ---: | ---: | ---: |
+| **Dynamic-role (proposed)** | **84.3 ± 1.2%** | **0.0 ± 0.0%** | **15.7 ± 1.2%** |
+| Fixed-role | 71.2 ± 1.4% | 0.0 ± 0.0% | 28.8 ± 1.4% |
+| Single-role (all interceptors) | 57.4 ± 1.6% | 1.4 ± 1.0% | 42.6 ± 1.6% |
+
+At 30 m, the proposed strategy improved defense success by **13.1 percentage points** over fixed-role assignment and **26.9 percentage points** over single-role assignment. The proposed strategy also had the lowest protected-asset hit rate. *(Manuscript: Table 2.)*
+
+### 2. Effect of LiDAR sensing range
+
+The table reports **defense success rate** across sensing conditions; each strategy was trained separately for the corresponding sensing range.
+
+| LiDAR range | Dynamic-role (proposed) | Fixed-role | Single-role |
+| --- | ---: | ---: | ---: |
+| 50 m | **94.3 ± 1.2%** | 89.5 ± 1.1% | 85.1 ± 0.7% |
+| 40 m | **93.0 ± 0.7%** | 78.0 ± 1.3% | 75.4 ± 3.1% |
+| 30 m | **84.3 ± 1.2%** | 71.2 ± 1.4% | 57.4 ± 1.6% |
+| 20 m | **68.6 ± 2.0%** | 40.0 ± 3.6% | 18.2 ± 0.8% |
+| 10 m | **15.8 ± 2.0%** | 13.2 ± 1.3% | 12.0 ± 0.8% |
+
+The dynamic-role strategy achieved the highest success rate at every evaluated range. Its advantage was particularly pronounced at **20 m** (a **28.6-percentage-point** gain over fixed-role and a **50.4-percentage-point** gain over single-role). At **10 m**, all strategies deteriorated substantially, suggesting that very late detection leaves insufficient time for interception. The manuscript also reports protected-asset hit and friendly collision rates for each range. *(Manuscript: Table 3.)*
+
+### 3. Effect of curriculum learning
+
+Under a **30 m** LiDAR range, the manuscript compares the proposed dynamic-role strategy with and without curriculum learning. The curriculum-based policy gradually reduced the interception radius from **15 m** to **1.5 m**, while the non-curriculum baseline used **1.5 m** throughout training.
+
+The manuscript's learning curves show that the curriculum-based policy reached stable performance earlier and attained a final defense success rate of **approximately 86%**, compared with **approximately 80%** without curriculum learning. These values are approximate readings/descriptions of the learning curves, not a separate mean ± standard deviation table. *(Manuscript: Figure 3.)*
+
+### 4. Effect of the number of defense UAVs (LiDAR: 30 m)
+
+| Defense UAVs | Defense success rate | Friendly collision rate | Protected-asset hit rate |
+| --- | ---: | ---: | ---: |
+| 3 | 84.3 ± 1.2% | 0.0 ± 0.0% | 15.7 ± 1.2% |
+| 4 | 89.2 ± 1.4% | 0.0 ± 0.0% | 10.8 ± 1.4% |
+| **5** | **94.5 ± 1.2%** | **0.0 ± 0.0%** | **5.5 ± 1.2%** |
+| 7 | 87.9 ± 2.4% | 5.0 ± 1.9% | 12.1 ± 2.4% |
+
+The **five-UAV** configuration achieved the best reported results among the evaluated team sizes. Increasing the team size further to seven reduced success and increased friendly collisions, indicating that additional UAVs do not always improve coordination. Each team size used a separately trained policy. *(Manuscript: Table 4.)*
+
+**Scope:** All figures above describe simulated performance under the manuscript's specified configurations. They should not be interpreted as verified real-world UAV performance or as a claim that the released repository reproduces the exact tabulated results without additional settings, models, and data.
+
+## Additional experimental materials (not yet included)
+
+The following directories are planned for future release but are **not included** in the current repository:
 
 | Planned path | Planned contents |
 | --- | --- |
-| `data/` | Experiment inputs, scenario settings, and non-sensitive evaluation data. |
-| `results/` | Quantitative results, comparative tables, and figures from the paper. |
-| `checkpoints/` | Trained model weights, if they can be shared. |
-| `docs/` | Additional experimental protocol, reproducibility notes, and publication details. |
+| `data/` | Experiment inputs, detailed scenario configurations, and shareable evaluation data. |
+| `results/` | Raw per-run evaluation outputs and exported figures underlying the reported manuscript results. |
+| `checkpoints/` | Trained model weights, if available for public release. |
+| `docs/` | Detailed reproduction protocol, parameter/seed information, and additional documentation. |
 
-When results are uploaded, include the exact experiment configuration, seeds, number of trials, definitions of metrics, and the code variant used to produce each result.
+When releasing additional artifacts, document the exact experiment configuration, random seeds, trial counts, metric definitions, and code variant used for each result.
 
 ## Relationship to the original MAPPO implementation
 
-This project builds on the publicly released MAPPO/on-policy implementation associated with:
+This project builds on the publicly released **MAPPO/on-policy** implementation associated with:
 
 Chao Yu et al., *The Surprising Effectiveness of PPO in Cooperative Multi-Agent Games* ([paper](https://arxiv.org/abs/2103.01955); [original repository](https://github.com/marlbenchmark/on-policy)).
 
-The repository retains the existing MIT `LICENSE` and original contributor attribution. UAV experiment environments and scripts are project-specific adaptations. Please cite the underlying MAPPO work when using its implementation, alongside the associated UAV study when citation information is published.
-
-## Citation
-
-**The UAV paper's citation information will be added here.**
+The repository retains the existing MIT `LICENSE` and original contributor attribution. UAV experiment environments and scripts are project-specific adaptations.
 
 ## License
 
-See [LICENSE](LICENSE). Respect the licenses and citation requirements of external software, including AirSim and any dependencies.
+See [LICENSE](LICENSE). Respect the licenses and applicable attribution requirements of external software, including AirSim and project dependencies.
