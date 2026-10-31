@@ -1,0 +1,1896 @@
+import gymnasium as gym
+import numpy as np
+import airsim
+import math
+import time
+import random
+from collections import deque
+
+
+class AirSimMultiDroneEnv:
+    metadata = {"render_modes": []}
+
+    def __init__(
+        self,
+        ip_address="127.0.0.1",
+        follower_names=("Follower0", "Follower1", "Follower2"),
+        port=41451,
+        step_length=0.01,
+        leader_velocity=3.0,
+        optimal_distance=10.0,
+        far_cutoff=60.0,
+        too_close=0.5,
+        dt=0.15,
+        do_visualize=True
+    ):
+        super().__init__()
+        self.possible_agents = list(follower_names)
+        self.agents = self.possible_agents[:]
+        print("[DEBUG env file] __init__ called")
+        print("[DEBUG env follower_names]", follower_names)
+        print("[DEBUG env possible_agents]", list(follower_names))
+
+        # 충돌 관련 설정
+        self.COLLISION_THRESHOLD = 1.5
+
+        # 하이퍼파라미터/환경 파라미터
+        self.step_length = float(step_length)
+        self.fixed_z = -10.0
+        self.dt = float(dt)
+        self.do_visualize = bool(do_visualize)
+        self.leader_velocity = float(leader_velocity)
+        self.optimal_distance = float(optimal_distance)
+        self.far_cutoff = float(far_cutoff)
+
+        # Lidar 메모리: { "AgentName": { "TargetName": [dx, dy] } }
+        self.lidar_memory = {}
+        self.prev_lidar_pos = {}
+        # Lidar 센서 이름 매핑
+        self.lidar_names = {
+            agent: f"{agent}_LidarSensor" for agent in self.possible_agents
+        }
+
+        # States
+        self.step_count = 0
+        self.episode_count = 0
+
+        # 통계 계산을 위한 Deque
+        self.stats_history = {
+            "win": deque(maxlen=20),
+            "coll_leader": deque(maxlen=20),
+            "coll_drone": deque(maxlen=20),
+            "coll_obj": deque(maxlen=20)
+        }
+
+        # 제거(전장에서 이탈) 상태 추적
+        self.eliminated_enemies = set()   # 요격 성공으로 제거된 적기 이름
+        self.eliminated_agents = set()    # 요격 시 함께 제거된 아군 이름
+
+        # 각 적기별 FSM 상태
+        self._obstacle_states = {}    # "IDLE" / "ATTACK" / "ELIMINATED"
+        self._obs_step_timers = {}
+        self._idle_wait_steps = {}
+        self._obstacle_speeds = {}
+
+        # 각 적기별 interceptor 매핑
+        self.interceptor_map = {}     # { "DynamicObstacle0": "Follower1", ... }
+        self.role_map = {a: "escort" for a in self.possible_agents}
+
+        # ===== 실제 적기 수 / 관측 슬롯 수 =====
+        self.dynamic_names = ["DynamicObstacle0"]   # 학습 시 실제 적은 1대만 사용
+        self.num_enemies = len(self.dynamic_names)  # 실제 적기 수
+
+        # obs에서 보는 적 슬롯 수는 고정: 아군 수만큼
+        self.K_ally = len(follower_names) - 1
+        self.max_enemy_slots = len(self.possible_agents)   # 3
+        self.K_enemy = self.max_enemy_slots
+
+        self.num_ally = self.K_ally
+        self.num_enemy = self.K_enemy
+        self.role_feat_dim = 2
+        self.target_feat_dim = self.num_enemy + 1
+
+        # 관측 공간 범위 정의
+        low_rel_pos = -1.0
+        high_rel_pos = 1.0
+        low_vel = -1.0
+        high_vel = 1.0
+        low_rate = -1.0
+        high_rate = 1.0
+        low_self_state = -1.0
+        high_self_state = 1.0
+
+        # 역할/표적 feature 차원
+        self.role_feat_dim = 2                  # [escort, interceptor]
+
+        # [리더(2)] + [아군(2)*K_ally] + [적(4)*K_enemy] + [self_state(2)] + [role(2)] + [target(num_enemy+1)]
+        per_agent_low = (
+            [low_rel_pos, low_rel_pos] +                                   # Leader (dx, dy)
+            [low_rel_pos, low_rel_pos] * self.num_ally +                   # Allies (dx, dy)
+            [low_rel_pos, low_rel_pos, low_vel, low_rate] * self.num_enemy +   # Enemies
+            [low_self_state] * 2 +                                         # Self (vx, vy)
+            [0.0] * self.role_feat_dim +                                   # role one-hot
+            [0.0] * self.target_feat_dim                                   # target one-hot
+        )
+
+        per_agent_high = (
+            [high_rel_pos, high_rel_pos] +
+            [high_rel_pos, high_rel_pos] * self.num_ally +
+            [high_rel_pos, high_rel_pos, high_vel, high_rate] * self.num_enemy +
+            [high_self_state] * 2 +
+            [1.0] * self.role_feat_dim +
+            [1.0] * self.target_feat_dim
+        )
+
+        obs_dim = len(per_agent_low)
+        share_obs_dim = obs_dim * len(self.possible_agents)
+
+        self.observation_spaces = {
+            agent: gym.spaces.Box(
+                low=np.array(per_agent_low, dtype=np.float32),
+                high=np.array(per_agent_high, dtype=np.float32),
+                shape=(obs_dim,),
+                dtype=np.float32,
+            )
+            for agent in self.possible_agents
+        }
+
+        self.MAX_SPEED = 10
+
+        self.action_spaces = {
+            agent: gym.spaces.Box(
+                low=-1.0,
+                high=1.0,
+                shape=(2,),
+                dtype=np.float64,
+            )
+            for agent in self.possible_agents
+        }
+
+        self.share_observation_spaces = gym.spaces.Box(
+            low=np.array(per_agent_low * len(self.possible_agents), dtype=np.float32),
+            high=np.array(per_agent_high * len(self.possible_agents), dtype=np.float32),
+            shape=(share_obs_dim,),
+            dtype=np.float32,
+        )
+
+        # PN 보상용 버퍼들
+        self._prev_los_angle = {
+            a: {dn: None for dn in self.dynamic_names}
+            for a in self.possible_agents
+        }
+
+        # =========================
+        # Simple curriculum rewards
+        # =========================
+        self.REWARD_STEP = 0.0
+        self.REWARD_SUCCESS_SINGLE = 0.9
+        self.REWARD_SUCCESS_ALL = 0.1
+        self.REWARD_FAIL = -3.0
+        self.REWARD_MISS = -1.0
+
+        self.ESCORT_MAX_RADIUS = 30.0
+        self.ESCORT_OUTSIDE_PENALTY = -0.05
+
+        # 요격 성공 판정 반경: curriculum 없이 1.5m 고정
+        self.hit_radius = 1.5
+        self.total_successes = 0
+        self.curriculum_pass_streak = 0
+
+        self.current_episode_hit_radius = self.hit_radius
+
+        self.REAL_LEADER_SPEED = 1.5
+        self.leader_move_timer = 0
+        self.current_leader_vel = [0.0, 0.0]
+        self.start_location = {}
+
+        # 위치 캐시
+        self.current_location = {}
+
+        self.obs_speed_min = 10.0
+        self.obs_speed_max = 10.0
+
+        # 시각화 설정
+        self.VIZ_REFRESH_SEC = 0.3
+        self.INTERCEPTOR_RING_RADIUS = 5.0
+
+        # 평가 지표(IR, SIR) 계산용 변수
+        self.primary_miss_occurred = False
+        self.final_interceptor = None
+        self.final_intercept_enemy = None
+        self.final_interceptor_role = None
+        self.assigned_interceptor_before_hit = None
+
+        # 에피소드 중 Follower ↔ Follower 충돌 발생 여부
+        # (Follower ↔ Leader 충돌은 LCR로 분류하므로 여기에는 포함하지 않음)
+        self.ally_collision_occurred = False
+
+        # ===== MISS 판정 파라미터 =====
+        self.MISS_ENGAGE_DIST = 10.0          # "한 번 충분히 붙었다"고 보는 기준
+        self.MISS_AE_GT_EL_MARGIN = 1.5      # d_AE > d_EL 판정 여유
+        self.MISS_LOSING_GEOM_STEPS = 1      # Case A 연속 step 수
+        self.MISS_RECEDING_STEPS = 1         # Case B 연속 이탈 step 수
+        self.MISS_RECEDING_DELTA = 0.5       # 최소거리보다 다시 이 정도 벌어져야 miss
+
+        self.PROTECTION_RADIUS = 8.0             # leader 기준 위험 반경
+        self.PROTECTION_REASSIGN_MARGIN = 0.5    # 새 후보가 이 정도는 더 좋아야 교체
+
+        # ATTACK 이후 agent-enemy 쌍별 추적 변수
+        self._prev_dist_to_enemy = {
+            a: {dn: None for dn in self.dynamic_names}
+            for a in self.possible_agents
+        }
+        self._engaged_once = {
+            a: {dn: False for dn in self.dynamic_names}
+            for a in self.possible_agents
+        }
+        self._min_dist_since_attack = {
+            a: {dn: 9999.0 for dn in self.dynamic_names}
+            for a in self.possible_agents
+        }
+        self._receding_steps = {
+            a: {dn: 0 for dn in self.dynamic_names}
+            for a in self.possible_agents
+        }
+        self._losing_geom_steps = {
+            a: {dn: 0 for dn in self.dynamic_names}
+            for a in self.possible_agents
+        }
+
+        self.HANDOFF_LEADER_MARGIN = 0.0
+
+        # 에피소드 내 요격 성공 카운트
+        self.enemies_killed_this_episode = 0
+        self.kill_log = []
+
+        # 클라이언트 셋업
+        self.client = airsim.MultirotorClient(ip=ip_address, port=port)
+        self.client.confirmConnection()
+
+        self._last_visualize_t = time.time()
+
+    # ======================================================================
+    # Lidar 관련
+    # ======================================================================
+    def _get_lidar_measurement(self, agent_name, target_name):
+        """
+        Lidar로 타겟을 관측한다.
+        제거된 개체는 관측하지 않고 기본값(0,0) 반환.
+        current_location / lidar_memory / point_cloud shape 이상에도 안전하게 동작.
+        """
+        # 제거된 개체는 관측 불가
+        if target_name in self.eliminated_enemies or target_name in self.eliminated_agents:
+            return 0.0, 0.0, False
+
+        # lidar_memory 초기화 안전장치
+        if agent_name not in self.lidar_memory:
+            self.lidar_memory[agent_name] = {}
+
+        cached_val = self.lidar_memory[agent_name].get(target_name, [0.0, 0.0])
+
+        # 위치 정보가 아직 없으면 캐시값 반환
+        if agent_name not in self.current_location or target_name not in self.current_location:
+            return cached_val[0], cached_val[1], False
+
+        try:
+            lidar_name = self.lidar_names[agent_name]
+            lidar_data = self.client.getLidarData(lidar_name, vehicle_name=agent_name)
+
+            raw_points = np.array(lidar_data.point_cloud, dtype=np.float32)
+
+            # point cloud 길이가 3의 배수가 아니면 그냥 캐시 반환
+            if raw_points.size < 3 or raw_points.size % 3 != 0:
+                return cached_val[0], cached_val[1], False
+
+            points = raw_points.reshape(-1, 3)
+            detected = False
+
+            my_pos = self.current_location[agent_name].position
+            tgt_pos = self.current_location[target_name].position
+
+            gt_dx = tgt_pos.x_val - my_pos.x_val
+            gt_dy = tgt_pos.y_val - my_pos.y_val
+
+            dist_sq = (points[:, 0] - gt_dx) ** 2 + (points[:, 1] - gt_dy) ** 2
+            mask = dist_sq < (5.0 ** 2)
+            target_points = points[mask]
+
+            if len(target_points) > 0:
+                mean_pos = np.mean(target_points, axis=0)
+                raw_dx = float(mean_pos[0])
+                raw_dy = float(mean_pos[1])
+
+                norm_dx = np.clip(raw_dx / 100.0, -1.0, 1.0)
+                norm_dy = np.clip(raw_dy / 100.0, -1.0, 1.0)
+
+                self.lidar_memory[agent_name][target_name] = [float(norm_dx), float(norm_dy)]
+                detected = True
+
+            final_val = self.lidar_memory[agent_name].get(target_name, [0.0, 0.0])
+            return final_val[0], final_val[1], detected
+
+        except Exception as e:
+            print(f"[LiDAR Error] agent={agent_name}, target={target_name}, err={e}")
+            final_val = self.lidar_memory[agent_name].get(target_name, [0.0, 0.0])
+            return final_val[0], final_val[1], False
+
+    def _calculate_lidar_dynamics(self, agent, target, curr_x, curr_y):
+        """Lidar의 (현재 위치 - 이전 위치) 차분으로 속도 정보 계산"""
+        if agent not in self.prev_lidar_pos:
+            self.prev_lidar_pos[agent] = {}
+        if target not in self.prev_lidar_pos[agent]:
+            self.prev_lidar_pos[agent][target] = [curr_x, curr_y]
+
+        prev_x, prev_y = self.prev_lidar_pos[agent][target]
+        dt = self.dt if self.dt > 1e-6 else 0.01
+
+        vx_rel = (curr_x - prev_x) / dt
+        vy_rel = (curr_y - prev_y) / dt
+
+        R_vec = np.array([curr_x, curr_y])
+        V_vec = np.array([vx_rel, vy_rel])
+        dist = np.linalg.norm(R_vec) + 1e-6
+
+        closing_speed = -float(np.dot(R_vec, V_vec)) / dist
+        cross_prod = float(R_vec[0]*V_vec[1] - R_vec[1]*V_vec[0])
+        los_rate = cross_prod / (dist**2)
+
+        norm_closing = np.clip(closing_speed / 30.0, -1.0, 1.0)
+        norm_los = np.clip(los_rate / 10.0, -1.0, 1.0)
+
+        return norm_closing, norm_los
+
+    def _get_current_location(self):
+        """
+        현재 위치 캐시 업데이트.
+        pose 획득 실패 시 기존 캐시를 유지해서 step 전체가 죽지 않게 한다.
+        """
+        new_location = dict(self.current_location) if hasattr(self, "current_location") else {}
+
+        def _safe_get_pose(name):
+            try:
+                return self.client.simGetObjectPose(name)
+            except Exception as e:
+                print(f"[Pose Error] {name}: {e}")
+                return new_location.get(name, None)
+
+        leader_pose = _safe_get_pose("Drone1")
+        if leader_pose is not None:
+            new_location["Drone1"] = leader_pose
+
+        for agent in self.agents:
+            if agent not in self.eliminated_agents:
+                pose = _safe_get_pose(agent)
+                if pose is not None:
+                    new_location[agent] = pose
+
+        for dn in self.dynamic_names:
+            if dn not in self.eliminated_enemies:
+                pose = _safe_get_pose(dn)
+                if pose is not None:
+                    new_location[dn] = pose
+
+        self.current_location = new_location
+
+    def _pose_to_xyz(self, name):
+        pose = self.current_location.get(name, None)
+        if pose is None:
+            return None
+
+        p = pose.position
+        return [float(p.x_val), float(p.y_val), float(p.z_val)]
+
+
+    def _record_episode_trace(self):
+        """
+        3D_animation.py가 요구하는 형식:
+        frame["positions"][이름] = [x, y, z]
+        """
+        if not hasattr(self, "episode_trace"):
+            self.episode_trace = []
+
+        positions = {}
+
+        # 리더
+        xyz = self._pose_to_xyz("Drone1")
+        if xyz is not None:
+            positions["Drone1"] = xyz
+
+        # 아군
+        for agent in self.possible_agents:
+            xyz = self._pose_to_xyz(agent)
+            if xyz is not None:
+                positions[agent] = xyz
+
+        # 적기
+        for dn in self.dynamic_names:
+            xyz = self._pose_to_xyz(dn)
+            if xyz is not None:
+                positions[dn] = xyz
+
+        current_interceptors = sorted([
+            intr for intr in self.interceptor_map.values()
+            if intr is not None
+        ])
+
+        frame = {
+            "step": int(self.step_count),
+            "positions": positions,
+
+            # 현재 step에서 역할 확인용
+            "roles": dict(self.role_map),
+            "interceptor_map": dict(self.interceptor_map),
+            "current_interceptors": current_interceptors,
+
+            # 종료 후 최종 요격 성공자 확인용
+            "interceptor": getattr(self, "final_interceptor", None),
+            "final_interceptor": getattr(self, "final_interceptor", None),
+            "final_intercept_enemy": getattr(self, "final_intercept_enemy", None),
+            "final_interceptor_role": getattr(self, "final_interceptor_role", None),
+            "assigned_interceptor_before_hit": getattr(self, "assigned_interceptor_before_hit", None),
+
+            "eliminated_agents": list(self.eliminated_agents),
+            "eliminated_enemies": list(self.eliminated_enemies),
+        }
+        self.episode_trace.append(frame)
+
+    # ======================================================================
+    # 초기화/이동/시각화 관련
+    # ======================================================================
+    def _hover(self, name):
+        self.client.moveByVelocityZAsync(
+            vx=0.0, vy=0.0,
+            z=self.fixed_z,
+            duration=0.3,
+            vehicle_name=name
+        ).join()
+
+        try:
+            self.client.hoverAsync(vehicle_name=name).join()
+        except:
+            pass
+
+    def _setup_flight(self):
+        self.client.enableApiControl(True, vehicle_name="Drone1")
+        self.client.armDisarm(True, vehicle_name="Drone1")
+
+        for agent in self.possible_agents:
+            self.client.enableApiControl(True, vehicle_name=agent)
+            self.client.armDisarm(True, vehicle_name=agent)
+
+        for dn in self.dynamic_names:
+            self.client.enableApiControl(True, vehicle_name=dn)
+            self.client.armDisarm(True, vehicle_name=dn)
+
+        # 1. 이륙
+        cmds = []
+        cmds.append(self.client.takeoffAsync(vehicle_name="Drone1"))
+        for agent in self.possible_agents:
+            cmds.append(self.client.takeoffAsync(vehicle_name=agent))
+        for dn in self.dynamic_names:
+            cmds.append(self.client.takeoffAsync(vehicle_name=dn))
+        for c in cmds:
+            c.join()
+
+        # 2. 텔레포트
+        pose_leader = airsim.Pose(
+            airsim.Vector3r(0, 0, self.fixed_z),
+            airsim.Quaternionr(0, 0, 0, 1)
+        )
+        self.client.simSetVehiclePose(pose_leader, True, vehicle_name="Drone1")
+
+        for i, agent in enumerate(self.possible_agents):
+            pose_agent = airsim.Pose(
+                airsim.Vector3r(0, 0, self.fixed_z),
+                airsim.Quaternionr(0, 0, 0, 1)
+            )
+            self.client.simSetVehiclePose(pose_agent, True, vehicle_name=agent)
+
+        for dn in self.dynamic_names:
+            pose_enemy = airsim.Pose(
+                airsim.Vector3r(0, 0, self.fixed_z),
+                airsim.Quaternionr(0, 0, 0, 1)
+            )
+            self.client.simSetVehiclePose(pose_enemy, True, vehicle_name=dn)
+
+        # 3. 속도 0으로 강제 초기화
+        cmds = []
+        cmds.append(self.client.moveByVelocityAsync(0, 0, 0, duration=0.1, vehicle_name="Drone1"))
+        for agent in self.possible_agents:
+            cmds.append(self.client.moveByVelocityAsync(0, 0, 0, duration=0.1, vehicle_name=agent))
+        for dn in self.dynamic_names:
+            cmds.append(self.client.moveByVelocityAsync(0, 0, 0, duration=0.1, vehicle_name=dn))
+        for c in cmds:
+            c.join()
+
+        time.sleep(0.5)
+
+        # 4. 초기 위치 저장
+        self.start_location["Drone1"] = self.client.simGetObjectPose("Drone1")
+        for agent in self.agents:
+            self.start_location[agent] = self.client.simGetObjectPose(agent)
+        for dn in self.dynamic_names:
+            self.start_location[dn] = self.client.simGetObjectPose(dn)
+
+        # Hover
+        self._hover("Drone1")
+        for agent in self.possible_agents:
+            self._hover(agent)
+        for dn in self.dynamic_names:
+            self._hover(dn)
+
+    def _update_leader_movement(self):
+        if self.do_visualize:
+            now = time.time()
+            if (now - self._last_visualize_t) >= 0.1:
+                self.client.simFlushPersistentMarkers()
+                self._visualize_circles()
+                self._last_visualize_t = now
+
+        if self.leader_move_timer <= 0:
+            pos = self.client.simGetObjectPose("Drone1").position
+            dist_from_origin = math.hypot(pos.x_val, pos.y_val)
+
+            if dist_from_origin > 50.0:
+                angle = math.atan2(-pos.y_val, -pos.x_val)
+                angle += random.uniform(-0.3, 0.3)
+            else:
+                angle = random.uniform(0, 2 * math.pi)
+
+            vx = math.cos(angle) * self.REAL_LEADER_SPEED
+            vy = math.sin(angle) * self.REAL_LEADER_SPEED
+            self.current_leader_vel = [vx, vy]
+            self.leader_move_timer = random.randint(20, 50)
+
+        self.leader_move_timer -= 1
+
+        yaw_mode = airsim.YawMode(is_rate=False, yaw_or_rate=0.0)
+        self.client.moveByVelocityZAsync(
+            vx=self.current_leader_vel[0],
+            vy=self.current_leader_vel[1],
+            z=self.fixed_z,
+            duration=self.dt,
+            yaw_mode=yaw_mode,
+            vehicle_name="Drone1"
+        )
+
+    def _visualize_circles(self):
+        """
+        AirSim 시각화 색상 규칙
+        - 유인기(Drone1)        : 노란색 원
+        - 요격자(interceptor)  : 초록색 원
+        - 호위자(escort)       : 파란색 원
+        - 적기(DynamicObstacle): 빨간색 원
+        """
+        try:
+            # 색상: [R, G, B, Alpha]
+            COLOR_LEADER = [1.0, 1.0, 0.0, 0.95]       # 노란색
+            COLOR_INTERCEPTOR = [0.0, 1.0, 0.0, 0.95]  # 초록색
+            COLOR_ESCORT = [0.0, 0.35, 1.0, 0.95]      # 파란색
+            COLOR_ENEMY = [1.0, 0.0, 0.0, 0.95]        # 빨간색
+
+            duration = self.VIZ_REFRESH_SEC + 0.05
+
+            def make_ring(cx, cy, cz, radius, n=48):
+                pts = []
+                for i in range(n + 1):
+                    ang = (i / n) * 2.0 * np.pi
+                    x = cx + radius * np.cos(ang)
+                    y = cy + radius * np.sin(ang)
+                    pts.append(airsim.Vector3r(x, y, cz))
+                return pts
+
+            def plot_ring(vehicle_name, color, radius=2.0, thickness=15.0):
+                """vehicle_name 위치 주변에 원 표시"""
+                pose = self.client.simGetObjectPose(vehicle_name)
+                p = pose.position
+
+                self.client.simPlotLineStrip(
+                    make_ring(p.x_val, p.y_val, p.z_val, radius),
+                    color,
+                    thickness=thickness,
+                    duration=duration,
+                    is_persistent=True
+                )
+
+            # =========================================================
+            # 1) 유인기(보호 대상): 노란색 원
+            # =========================================================
+            plot_ring(
+                "Drone1",
+                COLOR_LEADER,
+                radius=self.INTERCEPTOR_RING_RADIUS + 1.5,
+                thickness=14.0
+            )
+
+            # =========================================================
+            # 2) 아군 Follower: 역할에 따라 요격자/호위자 색상 구분
+            # =========================================================
+            for agent in self.possible_agents:
+                if agent in self.eliminated_agents:
+                    continue
+
+                role = self.role_map.get(agent, "escort")
+
+                if role == "interceptor":
+                    color = COLOR_INTERCEPTOR
+                    thickness = 12.0
+                else:
+                    color = COLOR_ESCORT
+                    thickness = 10.0
+
+                plot_ring(
+                    agent,
+                    color,
+                    radius=self.INTERCEPTOR_RING_RADIUS,
+                    thickness=thickness
+                )
+
+            # =========================================================
+            # 3) 적기: 빨간색 원
+            # =========================================================
+            for dn in self.dynamic_names:
+                if dn in self.eliminated_enemies:
+                    continue
+
+                plot_ring(
+                    dn,
+                    COLOR_ENEMY,
+                    radius=self.INTERCEPTOR_RING_RADIUS + 1.0,
+                    thickness=12.0
+                )
+
+            # =========================================================
+            # 4) 선택 사항: 요격자-적기 연결선
+            #    필요 없으면 이 블록만 주석 처리하면 됨.
+            # =========================================================
+            for dn, intr_name in self.interceptor_map.items():
+                if intr_name is None:
+                    continue
+                if dn in self.eliminated_enemies or intr_name in self.eliminated_agents:
+                    continue
+
+                enemy_pose = self.client.simGetObjectPose(dn)
+                intr_pose = self.client.simGetObjectPose(intr_name)
+
+                ep = enemy_pose.position
+                ip = intr_pose.position
+
+                self.client.simPlotLineStrip(
+                    [
+                        airsim.Vector3r(ip.x_val, ip.y_val, ip.z_val),
+                        airsim.Vector3r(ep.x_val, ep.y_val, ep.z_val)
+                    ],
+                    [0.0, 1.0, 0.0, 0.45],  # 요격자-적기 연결선: 반투명 초록색
+                    thickness=4.0,
+                    duration=duration,
+                    is_persistent=True
+                )
+
+        except Exception as e:
+            print(f"[Visualization Error] {e}")
+
+
+    def _protection_handoff_if_needed(self, enemy_name):
+        """
+        적이 leader 근처 위험 반경에 들어왔을 때,
+        현재 interceptor가 불리하면 선제적으로 handoff 시도.
+        적기 1대당 agent 1대 원칙은 그대로 유지.
+        """
+        if enemy_name in self.eliminated_enemies:
+            return False
+        if self._obstacle_states.get(enemy_name) != "ATTACK":
+            return False
+        if enemy_name not in self.current_location or "Drone1" not in self.current_location:
+            return False
+
+        pe = self.current_location[enemy_name].position
+        pl = self.current_location["Drone1"].position
+        d_EL = math.hypot(pe.x_val - pl.x_val, pe.y_val - pl.y_val)
+
+        # 아직 위험 반경 밖이면 아무것도 안 함
+        if d_EL > self.PROTECTION_RADIUS:
+            return False
+
+        old_agent = self.interceptor_map.get(enemy_name, None)
+
+        # interceptor가 없으면 그냥 새로 배정
+        if old_agent is None or old_agent in self.eliminated_agents:
+            return self._assign_interceptor_for_enemy(enemy_name)
+
+        # 현재 interceptor와 적 거리
+        pa_old = self.current_location[old_agent].position
+        old_dist = math.hypot(pa_old.x_val - pe.x_val, pa_old.y_val - pe.y_val)
+
+        # 현재 interceptor가 아직 leader보다 충분히 앞서 있으면 유지
+        if old_dist <= d_EL + self.MISS_AE_GT_EL_MARGIN:
+            return False
+
+        # 다른 적기의 interceptor는 후보 제외
+        already_assigned = set()
+        for dn, intr in self.interceptor_map.items():
+            if dn != enemy_name and intr is not None:
+                already_assigned.add(intr)
+
+        best_agent = old_agent
+        best_dist = old_dist
+
+        for a in self.possible_agents:
+            if a in self.eliminated_agents:
+                continue
+            if a == old_agent:
+                continue
+            if a in already_assigned:
+                continue
+            if not self._is_feasible_handoff_candidate(a, enemy_name):
+                continue
+            if a not in self.current_location:
+                continue
+
+            pa = self.current_location[a].position
+            d = math.hypot(pa.x_val - pe.x_val, pa.y_val - pe.y_val)
+
+            # 충분히 더 좋은 후보일 때만 교체
+            if d + self.PROTECTION_REASSIGN_MARGIN < best_dist:
+                best_agent = a
+                best_dist = d
+
+        if best_agent != old_agent:
+            self.interceptor_map[enemy_name] = best_agent
+            self._reset_attack_trackers_for_enemy(enemy_name)
+            self._refresh_role_map()
+            return True
+
+        return False
+
+    # ======================================================================
+    # 보상/종료 관련
+    # ======================================================================
+    def _compute_reward(self, agent):
+        if agent in self.eliminated_agents:
+            return 0.0
+
+        role = self.role_map.get(agent, "escort")
+
+        if role == "interceptor":
+            return self._compute_interceptor_reward(agent)
+
+        return self._compute_escort_reward(agent)
+
+    def _compute_interceptor_reward(self, agent):
+        base = self.REWARD_STEP
+
+        assigned_enemy = None
+        for dn, intr in self.interceptor_map.items():
+            if intr == agent:
+                assigned_enemy = dn
+                break
+
+        if assigned_enemy is None or assigned_enemy in self.eliminated_enemies:
+            return float(base)
+
+        pa = self.current_location[agent].position
+        pe = self.current_location[assigned_enemy].position
+        curr_dist = math.hypot(pa.x_val - pe.x_val, pa.y_val - pe.y_val)
+
+        prev_dist = self._prev_d_agent_enemy[agent].get(assigned_enemy, None)
+        self._prev_d_agent_enemy[agent][assigned_enemy] = curr_dist
+
+        reward = base
+
+        if prev_dist is not None:
+            delta = prev_dist - curr_dist
+            if delta > 0:
+                reward += np.clip(delta * 0.10, 0.0, 0.10)
+            else:
+                reward += np.clip(delta * 0.16, -0.16, 0.0)
+
+        if curr_dist < 10.0:
+            reward += 0.01
+        if curr_dist < 6.0:
+            reward += 0.03
+        if curr_dist < 3.0:
+            reward += 0.06
+        if curr_dist < 1.8:
+            reward += 0.10
+
+        return float(reward)
+
+    def _compute_escort_reward(self, agent):
+        if agent in self.eliminated_agents:
+            return 0.0
+
+        pa = self.current_location[agent].position
+        pl = self.current_location["Drone1"].position
+        d_leader = math.hypot(pa.x_val - pl.x_val, pa.y_val - pl.y_val)
+
+        if d_leader > self.ESCORT_MAX_RADIUS:
+            return float(self.ESCORT_OUTSIDE_PENALTY)
+
+        err = abs(d_leader - self.optimal_distance)
+
+        if err <= 3.0:
+            return 0.03
+        elif err <= 6.0:
+            return 0.015
+        elif err <= 10.0:
+            return 0.005
+        else:
+            return -0.005
+
+    def _build_intercept_reward(self, hit_agent, enemy_name, assigned_agent_snapshot):
+        rewards = {a: 0.0 for a in self.possible_agents}
+
+        if assigned_agent_snapshot == hit_agent:
+            rewards[hit_agent] += self.REWARD_SUCCESS_SINGLE
+            for a in self.possible_agents:
+                if a != hit_agent:
+                    rewards[a] += 0.1
+
+        return rewards
+
+    def _build_all_clear_reward(self):
+        """적기 전부 요격 → 최종 보상 1.0"""
+        return {a: float(self.REWARD_SUCCESS_ALL) for a in self.possible_agents}
+
+    def _update_curriculum_by_rolling(self, win_rate):
+        # Curriculum 제거: hit_radius는 항상 1.5m 고정
+        self.hit_radius = 1.5
+        return
+    
+    def _eliminate_pair(self, agent_name, enemy_name):
+        """
+        아군-적기 쌍을 전장에서 제거한다.
+        제거된 개체는 먼 곳으로 텔레포트하고 정지시킨다.
+        """
+        self.kill_log.append({
+            "agent": agent_name,
+            "enemy": enemy_name,
+            "role": self.role_map.get(agent_name, "escort")
+        })
+
+        self.eliminated_agents.add(agent_name)
+        self.eliminated_enemies.add(enemy_name)
+        self._obstacle_states[enemy_name] = "ELIMINATED"
+
+        # 역할 초기화
+        self.role_map[agent_name] = "eliminated"
+
+        # interceptor_map에서 해당 적기 제거
+        if enemy_name in self.interceptor_map:
+            del self.interceptor_map[enemy_name]
+
+        # 다른 적기의 interceptor가 이 아군이었으면 재배정 필요
+        for dn in self.dynamic_names:
+            if dn in self.eliminated_enemies:
+                continue
+            if self.interceptor_map.get(dn) == agent_name:
+                self.interceptor_map[dn] = None
+                self._assign_interceptor_for_enemy(dn)
+
+        # 물리적으로 먼 곳에 격리
+        far_pose = airsim.Pose(
+            airsim.Vector3r(9999, 9999, -100),
+            airsim.Quaternionr(0, 0, 0, 1)
+        )
+        self.client.simSetVehiclePose(far_pose, True, vehicle_name=agent_name)
+        self.client.moveByVelocityAsync(0, 0, 0, duration=0.1, vehicle_name=agent_name)
+
+        self.client.simSetVehiclePose(far_pose, True, vehicle_name=enemy_name)
+        self.client.moveByVelocityAsync(0, 0, 0, duration=0.1, vehicle_name=enemy_name)
+
+        self._refresh_role_map()
+        # print(f"[Eliminate] {agent_name} & {enemy_name} removed from battlefield")
+
+    def _eliminate_agent_only(self, agent_name):
+        """
+        적기 없이 아군 agent만 전장에서 제거한다.
+        아군-아군 충돌 시 사용.
+        """
+        if agent_name in self.eliminated_agents:
+            return
+
+        self.eliminated_agents.add(agent_name)
+        self.role_map[agent_name] = "eliminated"
+
+        # 이 agent가 맡고 있던 적기 있으면 배정 해제 후 재배정 시도
+        reassigned_enemies = []
+        for dn in list(self.interceptor_map.keys()):
+            if self.interceptor_map.get(dn) == agent_name:
+                self.interceptor_map[dn] = None
+                reassigned_enemies.append(dn)
+
+        # 물리적으로 먼 곳으로 보내서 완전히 사라지게
+        far_pose = airsim.Pose(
+            airsim.Vector3r(9999, 9999, -100),
+            airsim.Quaternionr(0, 0, 0, 1)
+        )
+        self.client.simSetVehiclePose(far_pose, True, vehicle_name=agent_name)
+        self.client.moveByVelocityAsync(0, 0, 0, duration=0.1, vehicle_name=agent_name)
+
+        self._refresh_role_map()
+
+        # 남아 있는 적기에 대해 요격기 재배정
+        for dn in reassigned_enemies:
+            if dn not in self.eliminated_enemies:
+                self._assign_interceptor_for_enemy(dn)
+
+
+    def _get_active_agents(self):
+        """제거되지 않은 활성 아군 목록"""
+        return [a for a in self.possible_agents if a not in self.eliminated_agents]
+
+    def _get_active_enemies(self):
+        """제거되지 않은 활성 적기 목록"""
+        return [dn for dn in self.dynamic_names if dn not in self.eliminated_enemies]
+    
+    def _is_feasible_handoff_candidate(self, agent, enemy_name):
+        """
+        다음 요격자로 뽑아도 되는지 검사
+        조건: agent-leader 거리 <= enemy-leader 거리 + margin
+        """
+        if agent in self.eliminated_agents:
+            return False
+        if enemy_name in self.eliminated_enemies:
+            return False
+        if agent not in self.current_location or enemy_name not in self.current_location:
+            return False
+
+        pa = self.current_location[agent].position
+        pe = self.current_location[enemy_name].position
+        pl = self.current_location["Drone1"].position
+
+        d_AL = math.hypot(pa.x_val - pl.x_val, pa.y_val - pl.y_val)  # agent-leader
+        d_EL = math.hypot(pe.x_val - pl.x_val, pe.y_val - pl.y_val)  # enemy-leader
+
+        return d_AL <= d_EL + self.HANDOFF_LEADER_MARGIN
+    
+    def _reset_attack_trackers_for_enemy(self, enemy_name):
+        """특정 적기가 ATTACK 시작할 때, 모든 agent에 대해 추적 변수 초기화"""
+        for agent in self.possible_agents:
+            self._prev_dist_to_enemy[agent][enemy_name] = None
+            self._engaged_once[agent][enemy_name] = False
+            self._min_dist_since_attack[agent][enemy_name] = 9999.0
+            self._receding_steps[agent][enemy_name] = 0
+            self._losing_geom_steps[agent][enemy_name] = 0
+
+    def _check_attack_miss(self, agent, enemy_name, curr_dist):
+        """
+        ATTACK 상태에서만 miss 판정
+
+        Case A. 처음부터 못 붙는 miss
+        - 아직 한 번도 충분히 가까워진 적 없음
+        - d_AE > d_EL + margin 가 연속 발생
+        - 동시에 d_AE 자체도 계속 증가
+
+        Case B. 붙었다가 놓치는 miss
+        - 한 번 충분히 가까워졌음
+        - 최소거리 이후 연속 이탈
+        - 현재 거리가 최소거리보다 충분히 다시 벌어짐
+        """
+        # ATTACK 상태가 아니면 판정 안 함
+        if self._obstacle_states.get(enemy_name) != "ATTACK":
+            return False, None
+
+        # 현재 거리들
+        pe = self.current_location[enemy_name].position
+        pl = self.current_location["Drone1"].position
+        d_EL = math.hypot(pe.x_val - pl.x_val, pe.y_val - pl.y_val)  # enemy-leader
+
+        prev_dist = self._prev_dist_to_enemy[agent][enemy_name]
+
+        # ATTACK 시작 후 첫 샘플이면 초기화만 하고 종료
+        if prev_dist is None:
+            self._prev_dist_to_enemy[agent][enemy_name] = curr_dist
+            self._min_dist_since_attack[agent][enemy_name] = curr_dist
+            return False, None
+
+        # "한 번 충분히 붙었음" 체크
+        if curr_dist < self.MISS_ENGAGE_DIST:
+            self._engaged_once[agent][enemy_name] = True
+
+        # ATTACK 이후 최소 거리 갱신
+        if curr_dist < self._min_dist_since_attack[agent][enemy_name]:
+            self._min_dist_since_attack[agent][enemy_name] = curr_dist
+
+        case_a_miss = False
+        case_b_miss = False
+
+        # =========================================================
+        # Case A: 처음부터 못 붙는 miss
+        # =========================================================
+        if not self._engaged_once[agent][enemy_name]:
+            if (
+                curr_dist > d_EL + self.MISS_AE_GT_EL_MARGIN
+                and curr_dist > prev_dist
+            ):
+                self._losing_geom_steps[agent][enemy_name] += 1
+            else:
+                self._losing_geom_steps[agent][enemy_name] = 0
+
+            if self._losing_geom_steps[agent][enemy_name] >= self.MISS_LOSING_GEOM_STEPS:
+                case_a_miss = True
+
+            # 아직 engage 안 했으면 Case B 카운트는 사용 안 함
+            self._receding_steps[agent][enemy_name] = 0
+
+        # =========================================================
+        # Case B: 붙었다가 놓치는 miss
+        # =========================================================
+        else:
+            # engage 이후에는 losing_geom 카운트는 사용 안 함
+            self._losing_geom_steps[agent][enemy_name] = 0
+
+            if curr_dist > prev_dist:
+                self._receding_steps[agent][enemy_name] += 1
+            else:
+                self._receding_steps[agent][enemy_name] = 0
+
+            if (
+                self._receding_steps[agent][enemy_name] >= self.MISS_RECEDING_STEPS
+                and curr_dist > self._min_dist_since_attack[agent][enemy_name] + self.MISS_RECEDING_DELTA
+            ):
+                case_b_miss = True
+
+        # 마지막에 prev 갱신
+        self._prev_dist_to_enemy[agent][enemy_name] = curr_dist
+
+        if case_a_miss:
+            return True, "CASE_A_NEVER_ENGAGED"
+        if case_b_miss:
+            return True, "CASE_B_RECEDING_AFTER_ENGAGE"
+
+        return False, None
+    
+    def _calc_interceptor_kill(self, status):
+        """interceptor가 요격한 비율. 실패 에피소드면 0."""
+        if "SUCCESS" not in status:
+            return 0.0
+        if len(self.kill_log) == 0:
+            return 0.0
+        interceptor_kills = sum(1 for k in self.kill_log if k["role"] == "interceptor")
+        return interceptor_kills / len(self.kill_log)
+
+    def _end_episode(self, reward, status):
+        _obs_list = []
+        _rewards_list = []
+        _terminations_list = []
+        _infos_list = []
+
+        if isinstance(reward, dict):
+            reward_dict = reward
+        else:
+            reward_dict = {a: float(reward) for a in self.possible_agents}
+
+        is_success = 1.0 if status == "SUCCESS_ALL_ENEMIES_ELIMINATED" else 0.0
+        is_partial = 1.0 if "SUCCESS_DISTANCE" in status and "ALL" not in status else 0.0
+
+        if "LEADER_AND_DYNAMIC" in status or "AGENT_LEADER" in status:
+            is_leader_hit = 1.0
+        else:
+            is_leader_hit = 0.0
+
+        # CR: 에피소드 중 Follower ↔ Follower 충돌이 한 번이라도 발생했으면 1
+        # Follower ↔ Leader 충돌은 위의 is_leader_hit(LCR)로만 집계
+        is_ally_collision = 1.0 if self.ally_collision_occurred else 0.0
+
+        is_obj_collision = 1.0 if "FAR_CUTOFF" in status else 0.0
+
+        intercept_range = 0.0
+        if is_success or is_partial:
+            lx = self.current_location["Drone1"].position.x_val
+            ly = self.current_location["Drone1"].position.y_val
+            # 가장 마지막으로 제거된 적기 기준 (활성 적이 없으면 0)
+            active_enemies = self._get_active_enemies()
+            if len(active_enemies) > 0:
+                last_e = active_enemies[0]
+                ex = self.current_location[last_e].position.x_val
+                ey = self.current_location[last_e].position.y_val
+                intercept_range = math.hypot(lx - ex, ly - ey)
+
+        self.stats_history["win"].append(is_success)
+        self.stats_history["coll_leader"].append(is_leader_hit)
+        self.stats_history["coll_drone"].append(is_ally_collision)
+        self.stats_history["coll_obj"].append(is_obj_collision)
+
+        # 전체 성공 횟수 카운트
+        if is_success:
+            self.total_successes += 1
+
+        def get_rate(key):
+            if len(self.stats_history[key]) > 0:
+                return sum(self.stats_history[key]) / len(self.stats_history[key])
+            return 0.0
+
+        win_rate = get_rate("win")
+
+        # 로그에 찍히는 rolling winrate와 같은 기준으로 curriculum 업데이트
+        self._update_curriculum_by_rolling(win_rate)
+
+        for agent in self.possible_agents:
+            _obs_list.append(self._get_obs(agent))
+            _rewards_list.append(float(reward_dict.get(agent, 0.0)))
+            _terminations_list.append(True)
+
+            _infos_list.append({
+                agent: {
+                    "final_status": status,
+                    "episode_success": is_success,
+                    "episode_leader_hit": is_leader_hit,
+                    "episode_ally_collision": is_ally_collision,
+                    "block_win_rate": win_rate,
+                    "win_rate": win_rate,
+                    "cur_episode_steps": self.step_count,
+                    "episode_intercept_range": intercept_range,
+                    "primary_miss_occurred": self.primary_miss_occurred,
+                    "episode_hit_radius": self.current_episode_hit_radius,
+                    "next_hit_radius": self.hit_radius,
+                    "total_successes": self.total_successes,
+                    "role": self.role_map.get(agent, "escort"),
+                    "enemies_killed": self.enemies_killed_this_episode,
+                    "eliminated_agents": list(self.eliminated_agents),
+                    "eliminated_enemies": list(self.eliminated_enemies),
+                    "episode_trace": self.episode_trace,
+                    "interceptor_kill": self._calc_interceptor_kill(status),
+
+                    "interceptor": self.final_interceptor,
+                    "final_interceptor": self.final_interceptor,
+                    "final_intercept_enemy": self.final_intercept_enemy,
+                    "final_interceptor_role": self.final_interceptor_role,
+                    "assigned_interceptor_before_hit": self.assigned_interceptor_before_hit,
+
+                    "episode_trace": self.episode_trace,
+                }
+            })
+
+        print(
+            f"[{self.episode_count} Ep] WinRate: {win_rate:.2f} | "
+            f"Status: {status} | "
+            f"enemies_killed={self.enemies_killed_this_episode}/{self.num_enemies} | "
+            f"episode_hit_radius={self.current_episode_hit_radius:.2f} | "
+            f"next_hit_radius={self.hit_radius:.2f} | "
+            f"total_successes={self.total_successes}"
+        )
+        return _obs_list, _rewards_list, _terminations_list, _infos_list
+
+    # --------------------- 동적장애물 FSM (2개) ---------------------
+    def _update_dynamic_obstacles(self):
+        """각 적기별로 독립적인 FSM 업데이트"""
+        for dn in self.dynamic_names:
+            if dn in self.eliminated_enemies:
+                continue
+            self._update_single_obstacle(dn)
+
+    def _update_single_obstacle(self, dn):
+        self._obs_step_timers[dn] += 1
+        target_speed = self._obstacle_speeds.get(dn, 3.0)
+        state = self._obstacle_states[dn]
+
+        if state == "IDLE":
+            self.client.moveByVelocityAsync(0, 0, 0, duration=0.1, vehicle_name=dn)
+            if self._obs_step_timers[dn] >= self._idle_wait_steps[dn]:
+                self._obstacle_states[dn] = "ATTACK"
+                self._obs_step_timers[dn] = 0
+                self._reset_attack_trackers_for_enemy(dn)
+                # print(f"[{dn}] IDLE -> ATTACK")
+
+        elif state == "ATTACK":
+            try:
+                leader_pose_live = self.client.simGetObjectPose("Drone1").position
+                obs_pos_live = self.client.simGetObjectPose(dn).position
+
+                l_vec = np.array([leader_pose_live.x_val, leader_pose_live.y_val, leader_pose_live.z_val])
+                o_vec = np.array([obs_pos_live.x_val, obs_pos_live.y_val, obs_pos_live.z_val])
+
+                diff = l_vec - o_vec
+                dist = np.linalg.norm(diff)
+
+                if dist > 0.5:
+                    direction = diff / dist
+                    vel = direction * target_speed
+
+                    self.client.moveByVelocityAsync(
+                        vx=float(vel[0]), vy=float(vel[1]), vz=float(vel[2]),
+                        duration=0.1,
+                        vehicle_name=dn
+                    )
+            except Exception as e:
+                print(f"[{dn}] Attack Logic Error: {e}")
+
+        # "ELIMINATED" 상태는 아무것도 하지 않음
+    def _measure_vehicle_offset(self, vehicle_name):
+        """드론의 VehiclePose와 ObjectPose 차이를 측정"""
+        vp = self.client.simGetVehiclePose(vehicle_name).position
+        op = self.client.simGetObjectPose(vehicle_name).position
+        return (op.x_val - vp.x_val, op.y_val - vp.y_val)
+
+    def _teleport_obstacle_randomly(self, dn):
+        leader_pos = self.client.simGetObjectPose("Drone1").position
+        lx, ly = leader_pos.x_val, leader_pos.y_val
+        radius = 80.0
+        angle = random.uniform(0, 2 * math.pi)
+
+        tx = lx + radius * math.cos(angle)
+        ty = ly + radius * math.sin(angle)
+        tz = self.fixed_z
+
+        # 오프셋 보정: ObjectPose 기준 목표를 VehiclePose 좌표로 변환
+        ox, oy = self._measure_vehicle_offset(dn)
+        pose = airsim.Pose(
+            airsim.Vector3r(tx - ox, ty - oy, tz),
+            airsim.Quaternionr(0, 0, 0, 1)
+        )
+        self.client.simSetVehiclePose(pose, True, vehicle_name=dn)
+        self.client.moveByVelocityAsync(0, 0, 0, duration=0.1, vehicle_name=dn).join()
+
+        # 디버그
+        actual = self.client.simGetObjectPose(dn).position
+        actual_dist = math.hypot(actual.x_val - lx, actual.y_val - ly)
+        # print(f"[Spawn Debug] {dn}: 목표={radius}m, 실제={actual_dist:.1f}m, "
+        #     f"leader=({lx:.1f},{ly:.1f}), target=({tx:.1f},{ty:.1f}), "
+        #     f"actual=({actual.x_val:.1f},{actual.y_val:.1f})")
+
+    def _reset_obstacle_logic(self):
+        """모든 적기를 초기화"""
+        self.eliminated_enemies.clear()
+        self.eliminated_agents.clear()
+        self.enemies_killed_this_episode = 0
+        self.kill_log = []
+
+        for idx, dn in enumerate(self.dynamic_names):
+            self._teleport_obstacle_randomly(dn)
+            self._obstacle_states[dn] = "IDLE"
+            self._obs_step_timers[dn] = 0
+            # 각 적기마다 다른 대기 시간 부여 → 시차 공격
+            base_wait = random.randint(10, 30)
+            self._idle_wait_steps[dn] = base_wait + idx * 10
+            self._obstacle_speeds[dn] = random.uniform(self.obs_speed_min, self.obs_speed_max)
+
+        self.interceptor_map = {}
+        self.role_map = {a: "escort" for a in self.possible_agents}
+
+    def _assign_interceptor_for_enemy(self, enemy_name, exclude_agent=None):
+        if enemy_name in self.eliminated_enemies:
+            return False
+
+        already_assigned = set()
+        for dn, intr in self.interceptor_map.items():
+            if intr is not None and dn != enemy_name:
+                already_assigned.add(intr)
+
+        all_candidates = [
+            a for a in self.possible_agents
+            if a not in self.eliminated_agents
+            and a not in already_assigned
+            and a != exclude_agent
+        ]
+
+        if len(all_candidates) == 0:
+            self.interceptor_map.pop(enemy_name, None)
+            return False
+
+        candidates = [
+            a for a in all_candidates
+            if self._is_feasible_handoff_candidate(a, enemy_name)
+        ]
+
+        if len(candidates) == 0:
+            self.interceptor_map.pop(enemy_name, None)
+            return False
+
+        visible_dist = {}
+        for agent in candidates:
+            ex, ey, detected = self._get_lidar_measurement(agent, enemy_name)
+            if detected:
+                dist = math.hypot(ex * 100.0, ey * 100.0)
+                visible_dist[agent] = dist
+
+        # LiDAR로 아무도 못 봤으면 배정 안 함
+        if len(visible_dist) == 0:
+            self.interceptor_map.pop(enemy_name, None)
+            return False
+
+        # LiDAR로 본 후보 중 가장 가까운 agent 선택
+        chosen = min(visible_dist, key=visible_dist.get)
+
+        self.interceptor_map[enemy_name] = chosen
+        self._reset_enemy_dense_buffers(enemy_name)
+        self._refresh_role_map()
+        return True
+
+    def _refresh_role_map(self):
+        all_interceptors = set(v for v in self.interceptor_map.values() if v is not None)
+
+        for a in self.possible_agents:
+            if a in self.eliminated_agents:
+                self.role_map[a] = "eliminated"
+            elif a in all_interceptors:
+                self.role_map[a] = "interceptor"
+            else:
+                self.role_map[a] = "escort"
+    
+    def _reset_enemy_dense_buffers(self, enemy_name):
+        for a in self.possible_agents:
+            self._prev_d_agent_enemy[a][enemy_name] = None
+    
+    def _get_visible_candidates_for_enemy(self, enemy_name, exclude_agent=None):
+        """
+        ATTACK 여부와 무관하게,
+        현재 LiDAR에 enemy가 실제로 보이는 agent 후보만 추린다.
+        """
+        if enemy_name in self.eliminated_enemies:
+            return {}
+
+        already_assigned = set()
+        for dn, intr in self.interceptor_map.items():
+            if dn != enemy_name and intr is not None:
+                already_assigned.add(intr)
+
+        visible_dist = {}
+
+        for agent in self.possible_agents:
+            if agent in self.eliminated_agents:
+                continue
+            if agent == exclude_agent:
+                continue
+            if agent in already_assigned:
+                continue
+            if not self._is_feasible_handoff_candidate(agent, enemy_name):
+                continue
+
+            ex, ey, detected = self._get_lidar_measurement(agent, enemy_name)
+            if detected:
+                visible_dist[agent] = math.hypot(ex * 100.0, ey * 100.0)
+
+        return visible_dist
+
+
+    def _assign_interceptor_if_visible(self, enemy_name, exclude_agent=None):
+        """
+        공격신호와 무관하게,
+        LiDAR에 보이는 순간 interceptor를 즉시 배정한다.
+        """
+        if enemy_name in self.eliminated_enemies:
+            return False
+
+        visible_dist = self._get_visible_candidates_for_enemy(
+            enemy_name,
+            exclude_agent=exclude_agent
+        )
+
+        if len(visible_dist) == 0:
+            return False
+
+        chosen = min(visible_dist, key=visible_dist.get)
+
+        self.interceptor_map[enemy_name] = chosen
+        self._reset_enemy_dense_buffers(enemy_name)
+        self._refresh_role_map()
+
+        return True
+
+    def _check_distance_collision(self, name_a, name_b, threshold):
+        """제거된 개체 간 거리는 항상 충돌하지 않은 것으로 처리"""
+        if name_a in self.eliminated_agents or name_a in self.eliminated_enemies:
+            return False, 9999.0
+        if name_b in self.eliminated_agents or name_b in self.eliminated_enemies:
+            return False, 9999.0
+
+        pa = self.current_location.get(name_a)
+        pb = self.current_location.get(name_b)
+        if pa is None or pb is None:
+            return False, 9999.0
+
+        pa = pa.position
+        pb = pb.position
+
+        dx = pa.x_val - pb.x_val
+        dy = pa.y_val - pb.y_val
+        dist = math.sqrt(dx * dx + dy * dy)
+        return dist < threshold, dist
+    
+    def _get_role_target_features(self, agent):
+        """
+        agent의 현재 역할(role)과 담당 표적(target)을 one-hot으로 반환
+        role_onehot   : [escort, interceptor]
+        target_onehot : [DynamicObstacle0, DynamicObstacle1, ..., no_target]
+        """
+        role_onehot = np.zeros(self.role_feat_dim, dtype=np.float32)
+        target_onehot = np.zeros(self.target_feat_dim, dtype=np.float32)
+
+        role = self.role_map.get(agent, "escort")
+
+        # role one-hot
+        if role == "interceptor":
+            role_onehot[1] = 1.0
+        else:
+            role_onehot[0] = 1.0
+
+        # target one-hot
+        assigned_target = None
+        for dn, intr in self.interceptor_map.items():
+            if intr == agent:
+                assigned_target = dn
+                break
+
+        if assigned_target is None:
+            target_onehot[-1] = 1.0   # no target
+        else:
+            if assigned_target in self.dynamic_names:
+                idx = self.dynamic_names.index(assigned_target)
+                target_onehot[idx] = 1.0
+            else:
+                target_onehot[-1] = 1.0
+
+        return role_onehot, target_onehot
+
+    # ======================================================================
+    # RL/PettingZoo API
+    # ======================================================================
+    @property
+    def observation_space(self):
+        return [self.observation_spaces[a] for a in self.possible_agents]
+
+    @property
+    def action_space(self):
+        return [self.action_spaces[a] for a in self.possible_agents]
+
+    @property
+    def share_observation_space(self):
+        return [self.share_observation_spaces for _ in self.possible_agents]
+
+    def seed(self, seed):
+        random.seed(seed)
+        np.random.seed(seed)
+
+    def _get_obs(self, agent):
+        """
+        제거된 아군은 전부 0인 관측을 반환한다.
+        제거된 적기는 (0, 0, 0, 0)으로 채운다.
+        obs 끝에는 현재 역할(role one-hot)과 담당 표적(target one-hot)을 추가한다.
+        """
+        obs_dim = self.observation_spaces[self.possible_agents[0]].shape[0]
+
+        if agent in self.eliminated_agents:
+            return np.zeros(obs_dim, dtype=np.float32)
+
+        # 1. 내 속도
+        try:
+            my_state = self.client.getMultirotorState(vehicle_name=agent)
+            vx = my_state.kinematics_estimated.linear_velocity.x_val
+            vy = my_state.kinematics_estimated.linear_velocity.y_val
+            norm_vx = np.clip(vx / self.MAX_SPEED, -1.0, 1.0)
+            norm_vy = np.clip(vy / self.MAX_SPEED, -1.0, 1.0)
+        except:
+            norm_vx, norm_vy = 0.0, 0.0
+
+        # 2. 리더 위치 (Lidar)
+        lx, ly, _ = self._get_lidar_measurement(agent, "Drone1")
+        _leader_feats = [lx, ly]
+
+        # 3. 아군 위치 (Lidar)
+        _ally_feats = []
+        other_agents = [a for a in self.possible_agents if a != agent]
+        for other in other_agents:
+            if other in self.eliminated_agents:
+                _ally_feats.extend([0.0, 0.0])
+            else:
+                ox, oy, _ = self._get_lidar_measurement(agent, other)
+                _ally_feats.append(ox)
+                _ally_feats.append(oy)
+
+        # 4. 적기들 (관측 슬롯은 항상 3칸 고정)
+        _dynamic_feats = []
+        for slot_idx in range(self.max_enemy_slots):
+            if slot_idx < len(self.dynamic_names):
+                dn = self.dynamic_names[slot_idx]
+
+                if dn in self.eliminated_enemies:
+                    _dynamic_feats.extend([0.0, 0.0, 0.0, 0.0])
+                else:
+                    ex, ey, is_enemy_visible = self._get_lidar_measurement(agent, dn)
+
+                    ex_meter = ex * 100.0
+                    ey_meter = ey * 100.0
+
+                    if is_enemy_visible:
+                        closing_norm, los_norm = self._calculate_lidar_dynamics(
+                            agent, dn, ex_meter, ey_meter
+                        )
+                    else:
+                        closing_norm, los_norm = 0.0, 0.0
+
+                    _dynamic_feats.extend([ex, ey, closing_norm, los_norm])
+            else:
+                _dynamic_feats.extend([0.0, 0.0, 0.0, 0.0])
+
+        # 5. 역할 / 담당 표적
+        role_onehot, target_onehot = self._get_role_target_features(agent)
+
+        # 6. 최종 obs
+        obs = np.concatenate([
+            np.array(_leader_feats, dtype=np.float32).flatten(),
+            np.array(_ally_feats, dtype=np.float32).flatten(),
+            np.array(_dynamic_feats, dtype=np.float32).flatten(),
+            np.array([norm_vx, norm_vy], dtype=np.float32),
+            role_onehot,
+            target_onehot
+        ]).astype(np.float32)
+
+        return obs
+
+    def _do_action(self, actions):
+        actions = np.clip(actions, -1, 1)
+        dt = self.dt
+
+        for i, agent in enumerate(self.possible_agents):
+            if agent in self.eliminated_agents:
+                continue
+
+            a = actions[i]
+            local_max_speed = self.MAX_SPEED
+
+            vx = float(a[0]) * local_max_speed
+            vy = float(a[1]) * local_max_speed
+
+            sp = math.hypot(vx, vy)
+            if sp > local_max_speed:
+                s = local_max_speed / (sp + 1e-6)
+                vx *= s
+                vy *= s
+
+            self.client.moveByVelocityZAsync(
+                vx=vx, vy=vy, z=self.fixed_z, duration=dt,
+                yaw_mode=airsim.YawMode(is_rate=False, yaw_or_rate=0.0),
+                vehicle_name=agent
+            )
+
+    def _get_rewards(self, per_agent_results):
+        return [float(r) for r in per_agent_results]
+
+    def reset(self, seed=None, options=None):
+        self.episode_count += 1
+        print(
+            f"에피소드: {self.episode_count} | 소비한 스텝 수: {self.step_count} | "
+            f"total_successes: {self.total_successes} | "
+            f"hit_radius: {self.hit_radius:.2f} m"
+        )
+
+        self.step_count = 0
+        self.agents = self.possible_agents[:]
+
+        self.leader_move_timer = 0
+        self.current_leader_vel = [0.0, 0.0]
+
+        self.client.reset()
+        self._setup_flight()
+        self.client.simFlushPersistentMarkers()
+
+        self._reset_obstacle_logic()
+        self._get_current_location()
+
+        self.episode_trace = []
+        self._record_episode_trace()
+
+        self._prev_d_agent_enemy = {
+            a: {dn: None for dn in self.dynamic_names}
+            for a in self.possible_agents
+        }
+
+        # 메모리 및 이전 위치 초기화
+        self.lidar_memory = {}
+        self.prev_lidar_pos = {}
+
+        all_targets = ["Drone1"] + [a for a in self.possible_agents] + self.dynamic_names
+
+        for agent in self.possible_agents:
+            self.lidar_memory[agent] = {}
+            self.prev_lidar_pos[agent] = {}
+
+            for tgt in all_targets:
+                if tgt == agent:
+                    continue
+                self.lidar_memory[agent][tgt] = [0.0, 0.0]
+                self.prev_lidar_pos[agent][tgt] = [0.0, 0.0]
+
+        self.primary_miss_occurred = False
+        self.final_interceptor = None
+        self.final_intercept_enemy = None
+        self.final_interceptor_role = None
+        self.assigned_interceptor_before_hit = None
+        self.ally_collision_occurred = False
+        
+        self.hit_radius = 1.5
+        self.current_episode_hit_radius = 1.5
+
+        self._prev_dist_to_enemy = {
+            a: {dn: None for dn in self.dynamic_names}
+            for a in self.possible_agents
+        }
+        self._engaged_once = {
+            a: {dn: False for dn in self.dynamic_names}
+            for a in self.possible_agents
+        }
+        self._min_dist_since_attack = {
+            a: {dn: 9999.0 for dn in self.dynamic_names}
+            for a in self.possible_agents
+        }
+        self._receding_steps = {
+            a: {dn: 0 for dn in self.dynamic_names}
+            for a in self.possible_agents
+        }
+        self._losing_geom_steps = {
+            a: {dn: 0 for dn in self.dynamic_names}
+            for a in self.possible_agents
+        }
+        obs_list = [self._get_obs(a) for a in self.agents]
+        return obs_list
+
+    def step(self, actions):
+        self.step_count += 1
+        self._pending_mid_reward = None
+
+        if self.step_count >= 1000000:
+            print(f"⏳[시간 초과] 스텝 {self.step_count} 도달! → 실패 처리")
+            return self._end_episode(self.REWARD_FAIL, "FAIL_TIMEOUT_LEADER_HIT")
+
+        per_agent_obs, per_agent_results, per_agent_infos = [], [], []
+
+        self._do_action(actions)
+        # self._update_leader_movement()
+        self._update_dynamic_obstacles()
+        self._get_current_location()
+        self._record_episode_trace()
+
+        for dn in self._get_active_enemies():
+            self._protection_handoff_if_needed(dn)
+
+        # 1) PLAN 3: ATTACK 여부 무시, LiDAR에 보이면 즉시 interceptor 배정
+        for dn in self._get_active_enemies():
+            cur_intr = self.interceptor_map.get(dn)
+
+            if cur_intr is None or cur_intr in self.eliminated_agents:
+                self._assign_interceptor_if_visible(dn)
+
+        # 2) 그래도 ATTACK까지 갔는데 아직 배정이 안 됐다면 기존 fallback 유지
+        for dn in self.dynamic_names:
+            if dn in self.eliminated_enemies:
+                continue
+
+            if self._obstacle_states[dn] == "ATTACK":
+                if self.interceptor_map.get(dn) is None or \
+                self.interceptor_map.get(dn) in self.eliminated_agents:
+                    self._assign_interceptor_for_enemy(dn)
+
+        if self.do_visualize:
+            now = time.time()
+            if (now - self._last_visualize_t) >= self.VIZ_REFRESH_SEC:
+                self.client.simFlushPersistentMarkers()
+                self._visualize_circles()
+                self._last_visualize_t = now
+
+        # ---- 에이전트별 체크 ----
+        active_agents = self._get_active_agents()
+
+        for agent in active_agents:
+            # === 적기별 거리 체크 (miss 판정 & 요격 성공) ===
+            for dn in self._get_active_enemies():
+                ex = self.current_location[dn].position.x_val
+                ey = self.current_location[dn].position.y_val
+                ax = self.current_location[agent].position.x_val
+                ay = self.current_location[agent].position.y_val
+
+                curr_dist = math.hypot(ex - ax, ey - ay)
+
+                # miss 판정 (ATTACK 이후만)
+                if self._obstacle_states[dn] == "ATTACK" and self.interceptor_map.get(dn) == agent:
+                    missed, miss_type = self._check_attack_miss(agent, dn, curr_dist)
+
+                    if missed:
+                        miss_reward = {a: 0.0 for a in self.possible_agents}
+                        miss_reward[agent] += self.REWARD_MISS
+                        self._pending_mid_reward = miss_reward
+                        self.primary_miss_occurred = True
+
+                        # miss 벌점 즉시 부여
+                        miss_reward = {a: 0.0 for a in self.possible_agents}
+                        miss_reward[agent] += self.REWARD_MISS
+                        self._pending_mid_reward = miss_reward
+
+                        # 현재 이 적기의 interceptor인 agent에 대해서만 handoff 수행
+                        if self.interceptor_map.get(dn) == agent:
+                            old_agent = agent
+
+                            self.interceptor_map[dn] = None
+                            self._reset_attack_trackers_for_enemy(dn)
+
+                            success = self._assign_interceptor_for_enemy(dn, exclude_agent=old_agent)
+
+                            # 조건 만족하는 새 요격자가 없으면 기존 요격자 유지
+                            if not success:
+                                self.interceptor_map[dn] = old_agent
+                                self._refresh_role_map()
+
+                # ATTACK 여부는 무시하고,
+                # 일단 LiDAR 기반으로 interceptor가 배정된 적기는 요격 성공 판정을 허용
+                if self.interceptor_map.get(dn) is not None:
+                    hit, d = self._check_distance_collision(
+                        agent, dn, threshold=self.current_episode_hit_radius
+                    )
+                    if hit:
+                        role = self.role_map.get(agent, "escort")
+                        assigned_agent_before_hit = self.interceptor_map.get(dn, None)
+
+                        # ==============================
+                        # [추가] 최종 요격 성공자 저장
+                        # ==============================
+                        self.final_interceptor = agent                  # 실제 적기와 충돌해서 요격 성공한 아군
+                        self.final_intercept_enemy = dn                 # 요격된 적기
+                        self.final_interceptor_role = role              # 요격 순간의 역할
+                        self.assigned_interceptor_before_hit = assigned_agent_before_hit
+
+                        # 마지막 trace frame에도 즉시 반영
+                        if hasattr(self, "episode_trace") and len(self.episode_trace) > 0:
+                            self.episode_trace[-1]["event"] = "intercept"
+                            self.episode_trace[-1]["interceptor"] = agent
+                            self.episode_trace[-1]["final_interceptor"] = agent
+                            self.episode_trace[-1]["final_intercept_enemy"] = dn
+                            self.episode_trace[-1]["final_interceptor_role"] = role
+                            self.episode_trace[-1]["assigned_interceptor_before_hit"] = assigned_agent_before_hit
+
+                        print(
+                            f"🎯[요격 성공] {agent}({role}) -> {dn} | "
+                            f"assigned_before_hit={assigned_agent_before_hit} | "
+                            f"hit_radius={self.current_episode_hit_radius:.2f}m"
+                        )
+
+                        mid_reward = self._build_intercept_reward(
+                            agent,
+                            dn,
+                            assigned_agent_before_hit
+                        )
+
+                        self._eliminate_pair(agent, dn)
+                        self.enemies_killed_this_episode += 1
+
+                        if len(self._get_active_enemies()) == 0:
+                            print(f"🏆[전체 요격 성공] 모든 적기 제거!")
+
+                            all_clear_reward = self._build_all_clear_reward()
+
+                            combined = {}
+                            for a in self.possible_agents:
+                                base = self._compute_reward(a)
+                                combined[a] = (
+                                    base
+                                    + mid_reward.get(a, 0.0)
+                                    + all_clear_reward.get(a, 0.0)
+                                )
+
+                            return self._end_episode(combined, "SUCCESS_ALL_ENEMIES_ELIMINATED")
+
+                        self._pending_mid_reward = mid_reward
+                        break
+
+            # 제거된 에이전트는 나머지 체크 건너뛰기
+            if agent in self.eliminated_agents:
+                continue
+
+            # 이탈 체크
+            _distance_leader = np.linalg.norm([
+                self.current_location[agent].position.x_val - self.current_location["Drone1"].position.x_val,
+                self.current_location[agent].position.y_val - self.current_location["Drone1"].position.y_val,
+                self.current_location[agent].position.z_val - self.current_location["Drone1"].position.z_val
+            ])
+
+            if _distance_leader > self.far_cutoff:
+                print(f"[이탈-무력화] {agent} 리더 거리 초과! → 해당 아군만 제거")
+
+                # 해당 agent에만 실패 패널티
+                if self._pending_mid_reward is None:
+                    self._pending_mid_reward = {a: 0.0 for a in self.possible_agents}
+
+                self._pending_mid_reward[agent] += float(self.REWARD_FAIL)
+
+                # 해당 아군만 무력화
+                self._eliminate_agent_only(agent)
+
+                # 전체 episode는 종료하지 않음
+                continue
+
+            # 리더와 충돌
+            hit, d = self._check_distance_collision(agent, "Drone1", threshold=self.COLLISION_THRESHOLD)
+            if hit:
+                print(f"⚠️💔[충돌] {agent} ↔ Leader")
+                return self._end_episode(self.REWARD_FAIL, "FAIL_DISTANCE_AGENT_LEADER")
+
+            # 아군끼리 충돌 (활성 아군끼리만)
+            for other in active_agents:
+                if other == agent or other in self.eliminated_agents:
+                    continue
+
+                # 같은 pair를 두 번 처리하지 않도록
+                if self.possible_agents.index(other) <= self.possible_agents.index(agent):
+                    continue
+
+                hit, d = self._check_distance_collision(agent, other, threshold=self.COLLISION_THRESHOLD)
+                if hit:
+                    print(f"💥🤖[충돌-제거] {agent} ↔ {other}")
+
+                    # 이 에피소드에서 Follower ↔ Follower 충돌이 발생했음을 기록
+                    self.ally_collision_occurred = True
+
+                    # "기존 패널티 그대로" = 기존처럼 -3을 전 에이전트에 부여
+                    collision_reward = {a: float(self.REWARD_FAIL) for a in self.possible_agents}
+
+                    if self._pending_mid_reward is None:
+                        self._pending_mid_reward = collision_reward
+                    else:
+                        for a in self.possible_agents:
+                            self._pending_mid_reward[a] = (
+                                self._pending_mid_reward.get(a, 0.0) + collision_reward[a]
+                            )
+
+                    # 충돌한 두 agent만 에피소드에서 제거
+                    self._eliminate_agent_only(agent)
+                    self._eliminate_agent_only(other)
+
+                    break
+
+        # 리더 피격 체크 (거리 기반: 아군-리더 / 아군-아군과 동일 방식)
+        for dn in self._get_active_enemies():
+            hit, d = self._check_distance_collision(
+                "Drone1",
+                dn,
+                threshold=self.COLLISION_THRESHOLD
+            )
+            if hit:
+                print(f"💥[피격-거리기반] Leader ↔ {dn} | dist={d:.2f}")
+                return self._end_episode(self.REWARD_FAIL, "FAIL_DISTANCE_LEADER_AND_DYNAMIC")
+
+        # 활성 아군이 전멸했는데 적이 아직 남아있는 경우
+        if len(self._get_active_agents()) == 0 and len(self._get_active_enemies()) > 0:
+            print(f"💀[전멸] 모든 아군이 제거됐지만 적기가 남아있음!")
+            return self._end_episode(self.REWARD_FAIL, "FAIL_ALL_AGENTS_ELIMINATED")
+
+        # ---- 관측 & 보상 수집 ----
+        for agent in self.possible_agents:
+            obs = self._get_obs(agent)
+            per_agent_obs.append(obs)
+
+            if agent in self.eliminated_agents:
+                if self._pending_mid_reward is not None:
+                    per_agent_results.append(self._pending_mid_reward.get(agent, 0.0))
+                else:
+                    per_agent_results.append(0.0)
+
+                per_agent_infos.append({
+                    "step_reward": 0.0,
+                    "role": "eliminated",
+                    "obstacle_states": {dn: self._obstacle_states[dn] for dn in self.dynamic_names}
+                })
+            else:
+                _reward = self._compute_reward(agent)
+                if self._pending_mid_reward is not None:
+                    _reward += self._pending_mid_reward.get(agent, 0.0)
+                per_agent_results.append(_reward)
+                per_agent_infos.append({
+                    "step_reward": _reward,
+                    "role": self.role_map.get(agent, "escort"),
+                    "interceptor_map": dict(self.interceptor_map),
+                    "obstacle_states": {dn: self._obstacle_states[dn] for dn in self.dynamic_names}
+                })
+
+                # lidar 이전 위치 저장
+                for dn in self._get_active_enemies():
+                    if dn in self.lidar_memory.get(agent, {}):
+                        norm_curr = self.lidar_memory[agent][dn]
+                        real_curr = [norm_curr[0] * 100.0, norm_curr[1] * 100.0]
+                        self.prev_lidar_pos[agent][dn] = real_curr
+
+        termination_list = [False for _ in self.possible_agents]
+        rewards_list = self._get_rewards(per_agent_results)
+        obs_list = per_agent_obs
+        infos_list = per_agent_infos
+
+        return obs_list, rewards_list, termination_list, infos_list
